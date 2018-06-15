@@ -8,7 +8,9 @@ cimport numpy as np
 import cytoolz
 from collections import OrderedDict
 import ujson
-import msgpack
+
+from .util import msgpack
+from .util import msgpack_numpy
 
 from thinc.api import chain
 from thinc.v2v import Affine, SELU, Softmax
@@ -31,6 +33,7 @@ from .parts_of_speech import X
 from ._ml import Tok2Vec, build_text_classifier, build_tagger_model
 from ._ml import link_vectors_to_models, zero_init, flatten
 from ._ml import create_default_optimizer
+from .errors import Errors, TempErrors
 from . import util
 
 
@@ -67,6 +70,34 @@ class SentenceSegmenter(object):
                 seen_period = True
         if start < len(doc):
             yield doc[start:len(doc)]
+
+
+def merge_noun_chunks(doc):
+    """Merge noun chunks into a single token.
+
+    doc (Doc): The Doc object.
+    RETURNS (Doc): The Doc object with merged noun chunks.
+    """
+    if not doc.is_parsed:
+        return
+    spans = [(np.start_char, np.end_char, np.root.tag, np.root.dep)
+             for np in doc.noun_chunks]
+    for start, end, tag, dep in spans:
+        doc.merge(start, end, tag=tag, dep=dep)
+    return doc
+
+
+def merge_entities(doc):
+    """Merge entities into a single token.
+
+    doc (Doc): The Doc object.
+    RETURNS (Doc): The Doc object with merged noun entities.
+    """
+    spans = [(e.start_char, e.end_char, e.root.tag, e.root.dep, e.label)
+             for e in doc.ents]
+    for start, end, tag, dep, ent_type in spans:
+        doc.merge(start, end, tag=tag, dep=dep, ent_type=ent_type)
+    return doc
 
 
 class Pipe(object):
@@ -139,7 +170,7 @@ class Pipe(object):
         problem.
         """
         raise NotImplementedError
-    
+
     def create_optimizer(self):
         return create_default_optimizer(self.model.ops,
                                         **self.cfg.get('optimizer', {}))
@@ -174,8 +205,10 @@ class Pipe(object):
     def from_bytes(self, bytes_data, **exclude):
         """Load the pipe from a bytestring."""
         def load_model(b):
+            # TODO: Remove this once we don't have to handle previous models
+            if 'pretrained_dims' in self.cfg and 'pretrained_vectors' not in self.cfg:
+                self.cfg['pretrained_vectors'] = self.vocab.vectors.name
             if self.model is True:
-                self.cfg.setdefault('pretrained_dims', self.vocab.vectors_length)
                 self.model = self.Model(**self.cfg)
             self.model.from_bytes(b)
 
@@ -199,8 +232,10 @@ class Pipe(object):
     def from_disk(self, path, **exclude):
         """Load the pipe from disk."""
         def load_model(p):
+            # TODO: Remove this once we don't have to handle previous models
+            if 'pretrained_dims' in self.cfg and 'pretrained_vectors' not in self.cfg:
+                self.cfg['pretrained_vectors'] = self.vocab.vectors.name
             if self.model is True:
-                self.cfg.setdefault('pretrained_dims', self.vocab.vectors_length)
                 self.model = self.Model(**self.cfg)
             self.model.from_bytes(p.open('rb').read())
 
@@ -258,7 +293,6 @@ class Tensorizer(Pipe):
         self.model = model
         self.input_models = []
         self.cfg = dict(cfg)
-        self.cfg['pretrained_dims'] = self.vocab.vectors.data.shape[1]
         self.cfg.setdefault('cnn_maxout_pieces', 3)
 
     def __call__(self, doc):
@@ -303,7 +337,8 @@ class Tensorizer(Pipe):
         tensors (object): Vector representation for each token in the docs.
         """
         for doc, tensor in zip(docs, tensors):
-            assert tensor.shape[0] == len(doc)
+            if tensor.shape[0] != len(doc):
+                raise ValueError(Errors.E076.format(rows=tensor.shape[0], words=len(doc)))
             doc.tensor = tensor
 
     def update(self, docs, golds, state=None, drop=0., sgd=None, losses=None):
@@ -375,8 +410,6 @@ class Tagger(Pipe):
         self.model = model
         self.cfg = OrderedDict(sorted(cfg.items()))
         self.cfg.setdefault('cnn_maxout_pieces', 2)
-        self.cfg.setdefault('pretrained_dims',
-                            self.vocab.vectors.data.shape[1])
 
     @property
     def labels(self):
@@ -487,8 +520,8 @@ class Tagger(Pipe):
             vocab.morphology = Morphology(vocab.strings, new_tag_map,
                                           vocab.morphology.lemmatizer,
                                           exc=vocab.morphology.exc)
+        self.cfg['pretrained_vectors'] = kwargs.get('pretrained_vectors')
         if self.model is True:
-            self.cfg['pretrained_dims'] = self.vocab.vectors.data.shape[1]
             self.model = self.Model(self.vocab.morphology.n_tags, **self.cfg)
         link_vectors_to_models(self.vocab)
         if sgd is None:
@@ -497,6 +530,8 @@ class Tagger(Pipe):
 
     @classmethod
     def Model(cls, n_tags, **cfg):
+        if cfg.get('pretrained_dims') and not cfg.get('pretrained_vectors'):
+            raise ValueError(TempErrors.T008)
         return build_tagger_model(n_tags, **cfg)
 
     def add_label(self, label, values=None):
@@ -512,9 +547,7 @@ class Tagger(Pipe):
             # copy_array(larger.W[:smaller.nO], smaller.W)
             # copy_array(larger.b[:smaller.nO], smaller.b)
             # self.model._layers[-1] = larger
-            raise ValueError(
-                "Resizing pre-trained Tagger models is not "
-                "currently supported.")
+            raise ValueError(TempErrors.T003)
         tag_map = dict(self.vocab.morphology.tag_map)
         if values is None:
             values = {POS: "X"}
@@ -544,6 +577,10 @@ class Tagger(Pipe):
 
     def from_bytes(self, bytes_data, **exclude):
         def load_model(b):
+            # TODO: Remove this once we don't have to handle previous models
+            if 'pretrained_dims' in self.cfg and 'pretrained_vectors' not in self.cfg:
+                self.cfg['pretrained_vectors'] = self.vocab.vectors.name
+
             if self.model is True:
                 token_vector_width = util.env_opt(
                     'token_vector_width',
@@ -569,7 +606,6 @@ class Tagger(Pipe):
         return self
 
     def to_disk(self, path, **exclude):
-        self.cfg.setdefault('pretrained_dims', self.vocab.vectors.data.shape[1])
         tag_map = OrderedDict(sorted(self.vocab.morphology.tag_map.items()))
         serialize = OrderedDict((
             ('vocab', lambda p: self.vocab.to_disk(p)),
@@ -582,6 +618,9 @@ class Tagger(Pipe):
 
     def from_disk(self, path, **exclude):
         def load_model(p):
+            # TODO: Remove this once we don't have to handle previous models
+            if 'pretrained_dims' in self.cfg and 'pretrained_vectors' not in self.cfg:
+                self.cfg['pretrained_vectors'] = self.vocab.vectors.name
             if self.model is True:
                 self.model = self.Model(self.vocab.morphology.n_tags, **self.cfg)
             with p.open('rb') as file_:
@@ -627,12 +666,9 @@ class MultitaskObjective(Tagger):
         elif hasattr(target, '__call__'):
             self.make_label = target
         else:
-            raise ValueError("MultitaskObjective target should be function or "
-                             "one of: dep, tag, ent, dep_tag_offset, ent_tag.")
+            raise ValueError(Errors.E016)
         self.cfg = dict(cfg)
         self.cfg.setdefault('cnn_maxout_pieces', 2)
-        self.cfg.setdefault('pretrained_dims',
-                            self.vocab.vectors.data.shape[1])
 
     @property
     def labels(self):
@@ -681,7 +717,9 @@ class MultitaskObjective(Tagger):
         return tokvecs, scores
 
     def get_loss(self, docs, golds, scores):
-        assert len(docs) == len(golds)
+        if len(docs) != len(golds):
+            raise ValueError(Errors.E077.format(value='loss', n_docs=len(docs),
+                                                n_golds=len(golds)))
         cdef int idx = 0
         correct = numpy.zeros((scores.shape[0],), dtype='i')
         guesses = scores.argmax(axis=1)
@@ -870,13 +908,15 @@ class TextCategorizer(Pipe):
         self.labels.append(label)
         return 1
 
-    def begin_training(self, gold_tuples=tuple(), pipeline=None, sgd=None):
+    def begin_training(self, gold_tuples=tuple(), pipeline=None, sgd=None,
+                       **kwargs):
         if pipeline and getattr(pipeline[0], 'name', None) == 'tensorizer':
             token_vector_width = pipeline[0].model.nO
         else:
             token_vector_width = 64
+
         if self.model is True:
-            self.cfg['pretrained_dims'] = self.vocab.vectors_length
+            self.cfg['pretrained_vectors'] = kwargs.get('pretrained_vectors')
             self.model = self.Model(len(self.labels), token_vector_width,
                                     **self.cfg)
             link_vectors_to_models(self.vocab)
@@ -892,7 +932,7 @@ cdef class DependencyParser(Parser):
     @property
     def postprocesses(self):
         return [nonproj.deprojectivize]
-    
+
     def add_multitask_objective(self, target):
         labeller = MultitaskObjective(self.vocab, target=target)
         self._multitasks.append(labeller)
@@ -913,7 +953,7 @@ cdef class EntityRecognizer(Parser):
     TransitionSystem = BiluoPushDown
 
     nr_feature = 6
-    
+
     def add_multitask_objective(self, target):
         labeller = MultitaskObjective(self.vocab, target=target)
         self._multitasks.append(labeller)
